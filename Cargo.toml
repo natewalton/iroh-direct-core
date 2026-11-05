@@ -60,4 +60,6 @@ type_marked_deprecated = { required-update = "minor" }
 type_method_marked_deprecated = { required-update = "minor" }
 
 [patch.crates-io]
+noq-udp = { path = "../noq/noq-udp" }
+noq = { path = "../noq/noq" }
 noq-proto = { path = "../noq/noq-proto" }

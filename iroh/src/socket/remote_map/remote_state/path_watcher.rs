@@ -75,7 +75,7 @@ pub enum PathEvent {
         /// Path statistics captured at close time.
         last_stats: Box<PathStats>,
     },
-    /// This path was selected for transmission of application data.
+    /// This path was selected by the transport. Payload permission is separate.
     #[non_exhaustive]
     Selected {
         /// Path identifier of the newly selected path.
@@ -466,9 +466,15 @@ impl<'conn> Path<'conn> {
         &self.data.local_addr
     }
 
-    /// Returns `true` if this path is currently selected for application data transmission.
+    /// Returns `true` if this path is selected by the transport, including control-only paths.
     pub fn is_selected(&self) -> bool {
         self.is_selected
+    }
+
+    /// Whether local payload policy permits this selected path now.
+    /// Last-observed eligibility is not a delivery or reachability guarantee.
+    pub fn application_data_allowed(&self) -> bool {
+        self.is_selected && self.data.upgrade(self.conn).application_data_allowed()
     }
 
     /// Returns `true` if this is a direct IP path.
@@ -552,5 +558,32 @@ impl Stream for PathEventStream {
             Ok(event) => Some(event),
             Err(BroadcastStreamRecvError::Lagged(missed)) => Some(PathEvent::Lagged { missed }),
         })
+    }
+}
+
+#[cfg(test)]
+mod policy_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn path_events_report_lag_without_changing_snapshot() {
+        let (sender, receiver) = PathStateSender::new();
+        let mut events = receiver.events();
+        // A slow diagnostic subscriber must be told that history is incomplete.
+        // Current snapshots are independent of the bounded event backlog.
+        for _ in 0..BROADCAST_CAPACITY * 2 {
+            sender
+                .events
+                .send(PathEvent::Selected {
+                    id: PathId::ZERO,
+                    remote_addr: TransportAddr::Ip("127.0.0.1:1234".parse().unwrap()),
+                    local_addr: LocalTransportAddr::Ip(None),
+                })
+                .unwrap();
+        }
+        assert!(matches!(events.next().await, Some(PathEvent::Lagged { missed }) if missed > 0));
+        let current = receiver.shared.state.lock().unwrap();
+        assert!(current.list.is_empty());
+        assert!(current.selected.is_none());
     }
 }
