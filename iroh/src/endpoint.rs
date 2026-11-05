@@ -132,6 +132,7 @@ pub struct Builder {
     secret_key: Option<SecretKey>,
     alpn_protocols: Vec<Vec<u8>>,
     transport_config: QuicTransportConfig,
+    direct_application_data_only: bool,
     keylog: bool,
     address_lookup: Vec<Box<dyn DynAddressLookupBuilder>>,
     address_lookup_user_data: Option<UserData>,
@@ -202,6 +203,7 @@ impl Builder {
             secret_key: Default::default(),
             alpn_protocols: Default::default(),
             transport_config: QuicTransportConfig::default(),
+            direct_application_data_only: false,
             keylog: Default::default(),
             address_lookup: Default::default(),
             address_lookup_user_data: Default::default(),
@@ -225,7 +227,10 @@ impl Builder {
 
     /// Binds the endpoint.
     #[instrument(name = "endpoint", skip_all, fields(id))]
-    pub async fn bind(self) -> Result<Endpoint, BindError> {
+    pub async fn bind(mut self) -> Result<Endpoint, BindError> {
+        if self.direct_application_data_only {
+            self.transport_config = self.transport_config.with_direct_application_data();
+        }
         let secret_key = self.secret_key.unwrap_or_else(SecretKey::generate);
         tracing::Span::current().record(
             "id",
@@ -664,6 +669,15 @@ impl Builder {
 
     // # Methods for more specialist customisation.
 
+    /// Permit application payload only on direct IP paths, retaining relay control.
+    ///
+    /// The restriction applies to incoming and outgoing connections and cannot be
+    /// weakened by later transport configuration overrides on this endpoint.
+    pub fn direct_application_data_only(mut self) -> Self {
+        self.direct_application_data_only = true;
+        self
+    }
+
     /// Sets a custom [`QuicTransportConfig`] for this endpoint.
     ///
     /// The transport config contains parameters governing the QUIC state machine.
@@ -675,6 +689,7 @@ impl Builder {
     ///
     /// Please be aware that changing some settings may have adverse effects on establishing
     /// and maintaining direct connections.
+
     pub fn transport_config(mut self, transport_config: QuicTransportConfig) -> Self {
         self.transport_config = transport_config;
         self
@@ -1143,10 +1158,13 @@ impl Endpoint {
 
         let mapped_addr = self.inner.resolve_remote(endpoint_addr).await??;
 
-        let transport_config = options
+        let mut transport_config = options
             .transport_config
-            .map(|cfg| cfg.to_inner_arc())
-            .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
+            .unwrap_or_else(|| self.inner.static_config.transport_config.clone());
+        if self.direct_application_data_only() {
+            transport_config = transport_config.with_direct_application_data();
+        }
+        let transport_config = transport_config.to_inner_arc();
 
         // Start connecting via noq. This will time out after 10 seconds if no reachable
         // address is available.
@@ -1190,10 +1208,19 @@ impl Endpoint {
         &self.inner.static_config.tls_config.secret_key
     }
 
+    /// Whether this endpoint's effective native config forbids relayed payload.
+    pub fn direct_application_data_only(&self) -> bool {
+        self.inner
+            .static_config
+            .transport_config
+            .direct_application_data_only()
+    }
+
     /// Returns the endpoint id of this endpoint.
     ///
     /// This ID is the unique addressing information of this endpoint and other peers must know
     /// it to be able to connect to this endpoint.
+
     pub fn id(&self) -> EndpointId {
         self.inner.static_config.tls_config.secret_key.public()
     }
@@ -2108,6 +2135,118 @@ mod tests {
     };
 
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
+
+    #[tokio::test]
+    async fn direct_application_data_effective_policy_and_order() {
+        use super::QuicTransportConfig;
+        for strict_first in [true, false] {
+            let mut builder = Endpoint::builder(presets::Minimal);
+            if strict_first {
+                builder = builder.direct_application_data_only();
+            }
+            builder = builder.transport_config(QuicTransportConfig::default());
+            if !strict_first {
+                builder = builder.direct_application_data_only();
+            }
+            let endpoint = builder
+                .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                .unwrap()
+                .bind()
+                .await
+                .unwrap();
+            assert!(endpoint.direct_application_data_only());
+            let filter = endpoint
+                .inner
+                .static_config
+                .transport_config
+                .to_inner_arc()
+                .get_application_data_filter()
+                .unwrap();
+            assert!(filter("127.0.0.1:1234".parse().unwrap()));
+            assert!(filter("[::1]:1234".parse().unwrap()));
+            for mapped in [
+                "[fd15:70a:510b::1]:1234",
+                "[fd15:70a:510b:1::1]:1234",
+                "[fd15:70a:510b:3::1]:1234",
+            ] {
+                assert!(!filter(mapped.parse().unwrap()), "{mapped}");
+            }
+            let overridden = endpoint
+                .create_server_config_builder(vec![TEST_ALPN.to_vec()])
+                .set_transport_config(QuicTransportConfig::default());
+            // Verify accepted config is constructed and remains valid after an override.
+            let _server_config = overridden.build();
+            endpoint.close().await;
+        }
+        let normal = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        assert!(!normal.direct_application_data_only());
+        normal.close().await;
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn direct_application_data_relay_config_overrides() -> Result {
+        use super::QuicTransportConfig;
+        let (relay_map, _, _relay_guard) = run_relay_server().await?;
+        let mut endpoints = Vec::new();
+        for _ in 0..2 {
+            endpoints.push(
+                Endpoint::builder(presets::Minimal)
+                    .alpns(vec![TEST_ALPN.to_vec()])
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                    .relay_mode(RelayMode::Custom(relay_map.clone()))
+                    .clear_ip_transports()
+                    .direct_application_data_only()
+                    .bind()
+                    .await?,
+            );
+        }
+        let server = &endpoints[0];
+        let client = &endpoints[1];
+        server.online().await;
+        client.online().await;
+        let server_config = Arc::new(
+            server
+                .create_server_config_builder(vec![TEST_ALPN.to_vec()])
+                .set_transport_config(QuicTransportConfig::default())
+                .build(),
+        );
+        let connecting = client.connect_with_opts(
+            server.addr(),
+            TEST_ALPN,
+            ConnectOptions::new().with_transport_config(QuicTransportConfig::default()),
+        );
+        let accepting = async {
+            let incoming = server.accept().await.unwrap();
+            incoming.accept_with(server_config).unwrap().await.unwrap()
+        };
+        let (outgoing, incoming) = tokio::join!(connecting, accepting);
+        let outgoing = outgoing?.await?;
+        // Both endpoint roles must keep the strict policy despite custom configs.
+        for conn in [&outgoing, &incoming] {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"must not use relay").await.unwrap();
+            send.finish().unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), send.stopped())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(conn.stats().frame_tx.stream, 0);
+        }
+        for conn in [&outgoing, &incoming] {
+            conn.close(0u32.into(), b"done");
+        }
+        for endpoint in endpoints {
+            endpoint.close().await;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     #[traced_test]

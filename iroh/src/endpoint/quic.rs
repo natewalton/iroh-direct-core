@@ -143,7 +143,28 @@ impl Default for QuicTransportConfig {
     }
 }
 
+fn direct_ip_payload_path(addr: std::net::SocketAddr) -> bool {
+    matches!(
+        crate::socket::mapped_addrs::MultipathMappedAddr::from(addr),
+        crate::socket::mapped_addrs::MultipathMappedAddr::Ip(_)
+    )
+}
+
 impl QuicTransportConfig {
+    pub(crate) fn with_direct_application_data(mut self) -> Self {
+        Arc::make_mut(&mut self.0).application_data_filter(direct_ip_payload_path);
+        self
+    }
+
+    pub(crate) fn direct_application_data_only(&self) -> bool {
+        self.0.get_application_data_filter().is_some_and(|filter| {
+            std::ptr::fn_addr_eq(
+                filter,
+                direct_ip_payload_path as fn(std::net::SocketAddr) -> bool,
+            )
+        })
+    }
+
     pub(crate) fn to_inner_arc(&self) -> Arc<noq::TransportConfig> {
         self.0.clone()
     }
@@ -622,7 +643,10 @@ impl ServerConfigBuilder {
     }
 
     /// Sets a custom [`QuicTransportConfig`].
-    pub fn set_transport_config(mut self, transport: QuicTransportConfig) -> Self {
+    pub fn set_transport_config(mut self, mut transport: QuicTransportConfig) -> Self {
+        if self.transport.direct_application_data_only() {
+            transport = transport.with_direct_application_data();
+        }
         self.inner.transport_config(transport.to_inner_arc());
         self.transport = transport;
         self
