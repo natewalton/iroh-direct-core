@@ -1,3 +1,16 @@
+# Experimental direct-payload Iroh fork
+
+Independent fork maintained by Nate Walton, not an official n0 release.
+This branch adds opt-in direct-only application payload and package-owned
+readiness. Relay connection control remains available. Upstream defaults are
+unchanged without the policy. Source APIs remain experimental: the inherited
+cross-builder accept_with configuration path is not covered by the endpoint
+policy; the published Node package does not expose it. Do not treat this source
+branch as a stable Rust security-policy API. See the separately versioned Node
+artifact in natewalton/iroh-ffi for the supported experimental surface.
+
+Original upstream documentation follows.
+
 <h1 align="center"><a href="https://iroh.computer"><img alt="iroh" src="./.img/iroh_wordmark.svg" width="100" /></a></h1>
 
 <h3 align="center">
